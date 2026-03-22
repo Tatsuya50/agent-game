@@ -1,0 +1,16 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# 環境変数（APIキーを含むため絶対にコミットしない）
+.env
+
+# FAISSインデックス（自動生成されるため不要）
+faiss_index/
