@@ -1,8 +1,8 @@
 """
-rules.py
-確定的ゲームロジック（ダメージ計算・HP/MP管理・勝敗判定）
-LLMはこのモジュールの「計算結果」を受け取るだけで、
-ロジック自体には一切触れません。これが「不変ルール」の核心です。
+rules.py (v2)
+確定的ゲームロジック — フルRPG対応版
+
+LLMは絶対にこの層に関与しない。
 """
 
 import random
@@ -10,262 +10,374 @@ from dataclasses import dataclass, field
 from typing import Literal, Optional
 
 # ---------------------------------------------------------------------------
-# データ型定義
+# キーワード分類テーブル
 # ---------------------------------------------------------------------------
 
-@dataclass
-class Character:
-    name: str
-    hp: int
-    max_hp: int
-    mp: int
-    max_mp: int
-    attack: int
-    defense: int
-    magic: int
-    speed: int
-    status_effects: list = field(default_factory=list)
-
-    def is_alive(self) -> bool:
-        return self.hp > 0
-
-    def to_dict(self) -> dict:
-        return {
-            "name": self.name,
-            "hp": self.hp,
-            "max_hp": self.max_hp,
-            "mp": self.mp,
-            "max_mp": self.max_mp,
-            "attack": self.attack,
-            "defense": self.defense,
-            "magic": self.magic,
-            "speed": self.speed,
-            "status_effects": list(self.status_effects),
-        }
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "Character":
-        return cls(
-            name=d["name"],
-            hp=d["hp"],
-            max_hp=d["max_hp"],
-            mp=d["mp"],
-            max_mp=d["max_mp"],
-            attack=d["attack"],
-            defense=d["defense"],
-            magic=d["magic"],
-            speed=d["speed"],
-            status_effects=list(d.get("status_effects", [])),
-        )
-
+PHYSICAL_KEYWORDS = {"攻撃", "たたかう", "斬る", "殴る", "attack", "strike", "slash", "剣", "撃つ"}
+MAGIC_KEYWORDS    = {"魔法", "呪文", "ファイア", "サンダー", "ブリザド", "炎", "氷", "雷", "magic", "spell"}
+DEFENSE_KEYWORDS  = {"防御", "守る", "ガード", "guard", "defend"}
+FLEE_KEYWORDS     = {"逃げる", "逃走", "flee", "run", "escape", "撤退"}
+HEAL_KEYWORDS     = {"回復", "ヒール", "heal", "ポーション", "薬草"}
+ITEM_KEYWORDS     = {"アイテム", "道具", "使う", "item", "use"}
 
 # ---------------------------------------------------------------------------
-# キーワード分類テーブル（行動テキスト → 行動種別）
-# ---------------------------------------------------------------------------
-
-PHYSICAL_KEYWORDS = {"攻撃", "たたかう", "撃つ", "斬る", "殴る", "attack", "strike", "slash", "剣"}
-MAGIC_KEYWORDS = {"魔法", "呪文", "ファイア", "サンダー", "ブリザド", "スペル", "magic", "spell", "炎", "氷", "雷"}
-DEFENSE_KEYWORDS = {"防御", "守る", "ガード", "身を守る", "guard", "defend", "block"}
-FLEE_KEYWORDS = {"逃げる", "逃走", "逃げ出す", "flee", "run", "escape", "撤退"}
-HEAL_KEYWORDS = {"回復", "治す", "ヒール", "heal", "restore", "ポーション", "薬草"}
-
-
-# ---------------------------------------------------------------------------
-# 不変ルール要約（Refereeエージェントの判定基準として渡す文字列）
+# 不変ルール要約（Referee判定基準）
 # ---------------------------------------------------------------------------
 
 IMMUTABLE_RULES_SUMMARY = """
 【不変ゲームルール（Referee判定基準）】
-1. 物理攻撃ダメージ = max(1, 攻撃者ATK - 防御者DEF) × 乱数係数[0.85〜1.15] × スキル倍率
-2. 魔法攻撃ダメージ = 攻撃者MAGIC × 1.5 × 乱数係数[0.90〜1.10] × スキル倍率（防御力を無視）
-3. HP・MPの回復量は最大値を絶対に超えない
-4. HP=0のキャラクターは行動不能。生き返りは不可能
-5. 1ターンに与えられる最大ダメージ = 対象の最大HP × 75%
-6. MP残量が必要コストを下回る場合、魔法・回復は発動不可
-7. 状態異常「毒」は毎ターン最大HPの5%のダメージを与え続ける
-8. 状態異常の重複適用は不可（同一効果は1回のみ有効）
-9. 防御行動時、プレイヤーの実質防御力は2倍になる
-10. 逃走成功率は40%。失敗時は敵の攻撃を受ける
+1. 物理攻撃ダメージ = max(1, 実効ATK - 実効DEF) × 乱数係数[0.85〜1.15]
+2. 魔法攻撃ダメージ = 実効MAGIC × 1.5 × 乱数係数[0.90〜1.10]（DEF無視）
+3. HP・MPの回復値は最大値を超えない
+4. HP=0のキャラは行動不能。死者の蘇生は不可能
+5. 1ターン最大ダメージ = 相手最大HPの75%
+6. MP不足時、魔法・回復は発動不可
+7. 毒ダメージ = 最大HPの5%/ターン
+8. 防御行動時: 受けるダメージを半減
+9. 逃走成功率 = 40%（固定）
+10. 経験値獲得後にレベルアップ条件を満たした場合、ステータスが成長する
+11. 装備ボーナスは balance.py の上限に従う
+12. 魔王戦では装備ボーナスに「試練補正」(0.7倍)が適用される
 """
 
-
 # ---------------------------------------------------------------------------
-# 不変ゲームロジック関数群
+# 純粋関数: ダメージ計算
 # ---------------------------------------------------------------------------
 
 def calculate_damage(
-    attacker: "Character",
-    defender: "Character",
+    attacker: dict,
+    defender: dict,
     action_type: Literal["physical", "magic"] = "physical",
     skill_power: float = 1.0,
 ) -> dict:
-    """
-    確定的ダメージ計算。
-    乱数はゲームルール外に振れないよう範囲を制限。
-    LLMはこの関数の存在も計算式も知らない。
-    """
-    if not attacker.is_alive():
-        return {
-            "damage": 0,
-            "is_miss": True,
-            "action_type": action_type,
-            "reason": "攻撃者はすでに倒れている",
-            "variance": 0.0,
-        }
+    if attacker.get("hp", 0) <= 0:
+        return {"damage": 0, "is_miss": True, "reason": "攻撃者はすでに倒れている", "variance": 0.0}
+    if "スタン" in attacker.get("status_effects", []):
+        return {"damage": 0, "is_miss": True, "reason": "スタン状態のため行動不能", "variance": 0.0}
 
-    # スタン状態は行動不能
-    if "スタン" in attacker.status_effects:
-        return {
-            "damage": 0,
-            "is_miss": True,
-            "action_type": action_type,
-            "reason": "スタン状態のため行動不能",
-            "variance": 0.0,
-        }
+    # 装備込みの実効ステータスを使用
+    eff_atk = attacker.get("effective_attack", attacker.get("attack", 0))
+    eff_def = defender.get("effective_defense", defender.get("defense", 0))
+    eff_mag = attacker.get("effective_magic", attacker.get("magic", 0))
 
     rng = random.random()
 
     if action_type == "physical":
-        base = max(1, attacker.attack - defender.defense)
-        variance = 0.85 + rng * 0.30          # 0.85 〜 1.15
-        raw_damage = int(base * variance * skill_power)
+        base    = max(1, eff_atk - eff_def)
+        variance = 0.85 + rng * 0.30
+        raw     = int(base * variance * skill_power)
 
     elif action_type == "magic":
-        if attacker.mp < 10:
-            return {
-                "damage": 0,
-                "is_miss": True,
-                "action_type": action_type,
-                "reason": "MP不足のため魔法が使用できない",
-                "variance": 0.0,
-            }
-        base = attacker.magic * 1.5
-        variance = 0.90 + rng * 0.20          # 0.90 〜 1.10
-        raw_damage = int(base * variance * skill_power)
+        if attacker.get("mp", 0) < 10:
+            return {"damage": 0, "is_miss": True, "reason": "MP不足のため魔法が使用できない", "variance": 0.0}
+        base    = eff_mag * 1.5
+        variance = 0.90 + rng * 0.20
+        raw     = int(base * variance * skill_power)
 
     else:
-        return {"damage": 0, "is_miss": True, "action_type": action_type, "reason": "不明な行動種別", "variance": 0.0}
+        return {"damage": 0, "is_miss": True, "reason": "不明な行動種別", "variance": 0.0}
 
-    # ルール5: 1ターン最大ダメージ上限 = 相手最大HPの75%
-    max_damage = int(defender.max_hp * 0.75)
-    final_damage = min(raw_damage, max_damage)
-
-    return {
-        "damage": final_damage,
-        "is_miss": False,
-        "action_type": action_type,
-        "reason": None,
-        "variance": round(variance, 3),
-    }
+    # ルール5: 1ターン最大ダメージ = 相手最大HPの75%
+    final = min(raw, int(defender.get("max_hp", 999) * 0.75))
+    return {"damage": final, "is_miss": False, "reason": None, "variance": round(variance, 3)}
 
 
-def apply_damage(character: "Character", damage: int) -> "Character":
-    """HPを減少させる。0未満にはならない。（不変ルール）"""
-    character.hp = max(0, character.hp - damage)
+def apply_damage(character: dict, damage: int) -> dict:
+    character["hp"] = max(0, character["hp"] - damage)
     return character
 
 
-def apply_heal(character: "Character", amount: int) -> tuple:
-    """
-    HP回復。ルール3: 最大HPを超えない。
-    Returns: (更新後キャラクター, 実際に回復した量)
-    """
-    before = character.hp
-    character.hp = min(character.max_hp, character.hp + amount)
-    actual_heal = character.hp - before
-    return character, actual_heal
+def apply_heal(character: dict, amount: int) -> tuple:
+    before = character["hp"]
+    character["hp"] = min(character["max_hp"], character["hp"] + amount)
+    return character, character["hp"] - before
 
 
-def apply_mp_cost(character: "Character", cost: int) -> tuple:
-    """
-    MP消費。MP不足の場合はFalseを返す。
-    Returns: (更新後キャラクター, 成功フラグ)
-    """
-    if character.mp < cost:
+def apply_mp_cost(character: dict, cost: int) -> tuple:
+    if character.get("mp", 0) < cost:
         return character, False
-    character.mp = max(0, character.mp - cost)
+    character["mp"] = max(0, character["mp"] - cost)
     return character, True
 
 
-def apply_status_effect(character: "Character", effect: str) -> tuple:
-    """
-    状態異常適用。ルール8: 重複適用不可。
-    Returns: (更新後キャラクター, 適用成功フラグ)
-    """
-    if effect in character.status_effects:
+def apply_status_effect(character: dict, effect: str) -> tuple:
+    effects = character.setdefault("status_effects", [])
+    if effect in effects:
         return character, False
-    character.status_effects.append(effect)
+    effects.append(effect)
     return character, True
 
 
-def apply_poison_tick(character: "Character") -> tuple:
-    """
-    ルール7: 毒ダメージ処理（毎ターン最大HPの5%）。
-    Returns: (更新後キャラクター, 毒ダメージ量)
-    """
-    if "毒" not in character.status_effects:
+def apply_poison_tick(character: dict) -> tuple:
+    if "毒" not in character.get("status_effects", []):
         return character, 0
-    poison_damage = max(1, int(character.max_hp * 0.05))
-    character.hp = max(0, character.hp - poison_damage)
-    return character, poison_damage
+    dmg = max(1, int(character.get("max_hp", 100) * 0.05))
+    character["hp"] = max(0, character["hp"] - dmg)
+    return character, dmg
 
 
-def check_battle_outcome(
-    player: "Character", enemy: "Character"
-) -> Literal["player_win", "enemy_win", "ongoing"]:
-    """
-    ルール10: 勝敗判定。純粋なPython関数。
-    LLMはこの結果を絶対に覆せない。これがシステムの根幹。
-    """
-    if not enemy.is_alive():
+def check_battle_outcome(party: list, enemy: dict) -> Literal["player_win", "enemy_win", "ongoing"]:
+    """パーティー全滅 or 敵HP=0 で勝敗決定。"""
+    if enemy.get("hp", 0) <= 0:
         return "player_win"
-    if not player.is_alive():
+    if all(m.get("hp", 0) <= 0 for m in party):
         return "enemy_win"
     return "ongoing"
 
 
-def classify_action(
-    action_text: str,
-) -> Literal["physical", "magic", "defend", "flee", "heal", "unknown"]:
-    """プレイヤー行動テキストを行動種別に分類する（LLM不使用）。"""
-    text = action_text.lower()
+# ---------------------------------------------------------------------------
+# レベルアップ
+# ---------------------------------------------------------------------------
+
+def gain_exp(character: dict, exp: int) -> dict:
+    """経験値を獲得し、レベルアップを処理する。Returns 更新後キャラ。"""
+    character["exp"] = character.get("exp", 0) + exp
+    while character["exp"] >= character.get("exp_to_next", 100):
+        character = _level_up(character)
+    return character
+
+
+def _level_up(character: dict) -> dict:
+    character["exp"]         -= character.get("exp_to_next", 100)
+    character["level"]        = character.get("level", 1) + 1
+    lv                        = character["level"]
+
+    # 成長量（レベルが上がるほど伸びが鈍化）
+    character["max_hp"]   = int(character["max_hp"]   * 1.12)
+    character["hp"]       = character["max_hp"]           # HP全回復
+    character["max_mp"]   = int(character["max_mp"]   * 1.08)
+    character["mp"]       = character["max_mp"]
+    character["attack"]   = int(character["attack"]   * 1.07)
+    character["defense"]  = int(character["defense"]  * 1.07)
+    character["magic"]    = int(character["magic"]    * 1.07)
+    character["speed"]    = int(character["speed"]    * 1.05)
+
+    # HP/MPの上限
+    character["max_hp"]  = min(999, character["max_hp"])
+    character["max_mp"]  = min(500, character["max_mp"])
+    character["hp"]      = min(999, character["hp"])
+    character["mp"]      = min(500, character["mp"])
+
+    # 次のレベルアップに必要な経験値（指数的に増加）
+    character["exp_to_next"] = int(100 * (lv ** 1.5))
+
+    character["leveled_up"] = True
+    return character
+
+
+# ---------------------------------------------------------------------------
+# 装備適用
+# ---------------------------------------------------------------------------
+
+def apply_equipment_to_stats(character: dict) -> dict:
+    """装備を含めた実効ステータスをcharacterに付与して返す。"""
+    equipment = character.get("equipment", {})
+    character["effective_attack"]  = character.get("attack", 0)  + sum(e.get("bonus_attack", 0)  for e in equipment.values())
+    character["effective_defense"] = character.get("defense", 0) + sum(e.get("bonus_defense", 0) for e in equipment.values())
+    character["effective_magic"]   = character.get("magic", 0)   + sum(e.get("bonus_magic", 0)   for e in equipment.values())
+    character["effective_speed"]   = character.get("speed", 0)   + sum(e.get("bonus_speed", 0)   for e in equipment.values())
+    return character
+
+
+# ---------------------------------------------------------------------------
+# 行動分類
+# ---------------------------------------------------------------------------
+
+def classify_action(text: str) -> str:
+    t = text.lower()
     for kw in MAGIC_KEYWORDS:
-        if kw in text:
-            return "magic"
+        if kw in t: return "magic"
     for kw in HEAL_KEYWORDS:
-        if kw in text:
-            return "heal"
+        if kw in t: return "heal"
     for kw in DEFENSE_KEYWORDS:
-        if kw in text:
-            return "defend"
+        if kw in t: return "defend"
     for kw in FLEE_KEYWORDS:
-        if kw in text:
-            return "flee"
-    for kw in PHYSICAL_KEYWORDS:
-        if kw in text:
-            return "physical"
-    return "physical"  # デフォルトは物理攻撃
+        if kw in t: return "flee"
+    for kw in ITEM_KEYWORDS:
+        if kw in t: return "item"
+    return "physical"
 
 
 # ---------------------------------------------------------------------------
-# デフォルトキャラクター
+# バトル解決（1ターン）
 # ---------------------------------------------------------------------------
 
-def get_default_player() -> Character:
-    return Character(
-        name="勇者アレン",
-        hp=100, max_hp=100,
-        mp=50,  max_mp=50,
-        attack=25, defense=10,
-        magic=20, speed=15,
-    )
+def resolve_battle_turn(
+    action_text: str,
+    party: list,
+    enemy: dict,
+    is_maou_battle: bool = False,
+) -> dict:
+    """
+    1ターンのバトルを純粋Python関数で解決する。
+    パーティー全員が行動し、敵が反撃する。
+    LLMはこの関数に一切関与しない。
+    """
+    from balance import apply_trial_correction, get_effective_stats
+
+    action_type = classify_action(action_text)
+
+    result = {
+        "action_type": action_type,
+        "player_action": action_text,
+        "party_actions": [],
+        "enemy_damage_dealt": 0,
+        "total_player_damage": 0,
+        "total_heal": 0,
+        "poison_damage": 0,
+        "exp_gained": 0,
+        "level_ups": [],
+        "is_miss": False,
+        "reason": None,
+        "flee_success": False,
+        "outcome": "ongoing",
+    }
+
+    # --- 逃走処理 ---
+    if action_type == "flee":
+        success = random.random() < 0.40
+        result["flee_success"] = success
+        result["outcome"] = "fled" if success else "ongoing"
+        if success:
+            result["summary"] = "戦闘から逃走に成功した！"
+            return result
+
+    # --- プレイヤー（+仲間）の行動 ---
+    alive_party = [m for m in party if m.get("hp", 0) > 0]
+
+    for i, member in enumerate(alive_party):
+        member = apply_equipment_to_stats(member)
+
+        # 魔王戦は試練補正適用
+        if is_maou_battle:
+            member = get_effective_stats(member, is_maou_battle=True)
+
+        act = action_type if i == 0 else "physical"  # 仲間は物理攻撃
+        action_result = {"member": member["name"], "damage": 0, "heal": 0, "miss": False, "reason": None}
+
+        if act == "physical":
+            dmg_info = calculate_damage(member, enemy, "physical")
+            action_result["miss"] = dmg_info["is_miss"]
+            action_result["reason"] = dmg_info.get("reason")
+            if not dmg_info["is_miss"]:
+                enemy = apply_damage(enemy, dmg_info["damage"])
+                action_result["damage"] = dmg_info["damage"]
+                result["total_player_damage"] += dmg_info["damage"]
+
+        elif act == "magic":
+            mp_cost = 15
+            member, mp_ok = apply_mp_cost(member, mp_cost)
+            if mp_ok:
+                dmg_info = calculate_damage(member, enemy, "magic", skill_power=1.2)
+                action_result["miss"] = dmg_info["is_miss"]
+                action_result["reason"] = dmg_info.get("reason")
+                if not dmg_info["is_miss"]:
+                    enemy = apply_damage(enemy, dmg_info["damage"])
+                    action_result["damage"] = dmg_info["damage"]
+                    result["total_player_damage"] += dmg_info["damage"]
+            else:
+                action_result["miss"] = True
+                action_result["reason"] = "MP不足"
+
+        elif act == "heal":
+            mp_cost = 10
+            member, mp_ok = apply_mp_cost(member, mp_cost)
+            if mp_ok:
+                member, healed = apply_heal(member, 30)
+                action_result["heal"] = healed
+                result["total_heal"] += healed
+            else:
+                action_result["miss"] = True
+                action_result["reason"] = "MP不足のため回復できない"
+
+        elif act == "defend":
+            action_result["defend"] = True
+
+        result["party_actions"].append(action_result)
+        party[party.index(next(m for m in party if m["name"] == member["name"]))] = member
+
+        # 敵が倒れたらそれ以降の行動は不要
+        if enemy.get("hp", 0) <= 0:
+            break
+
+    result["is_miss"] = result["party_actions"][0]["miss"] if result["party_actions"] else False
+    result["reason"] = result["party_actions"][0]["reason"] if result["party_actions"] else None
+
+    # --- 敵の反撃 ---
+    if enemy.get("hp", 0) > 0:
+        enemy = apply_equipment_to_stats(enemy)
+        target = alive_party[0] if alive_party else party[0]
+        defend_mode = action_type == "defend"
+
+        if defend_mode:
+            orig_def = target["defense"]
+            target["defense"] = orig_def * 2
+        enemy_dmg = calculate_damage(enemy, target, "physical")
+        if defend_mode:
+            target["defense"] = orig_def
+
+        if not enemy_dmg["is_miss"]:
+            target = apply_damage(target, enemy_dmg["damage"])
+            result["enemy_damage_dealt"] = enemy_dmg["damage"]
+            party[party.index(next(m for m in party if m["name"] == target["name"]))] = target
+
+    # --- 毒ダメージ ---
+    for i, member in enumerate(party):
+        if member.get("hp", 0) > 0:
+            member, pdmg = apply_poison_tick(member)
+            result["poison_damage"] += pdmg
+            party[i] = member
+
+    # --- 勝敗判定 ---
+    result["outcome"] = check_battle_outcome(party, enemy)
+
+    # --- 経験値獲得 ---
+    if result["outcome"] == "player_win":
+        exp = enemy.get("exp_reward", 50)
+        result["exp_gained"] = exp
+        for i, member in enumerate(party):
+            before_lv = member.get("level", 1)
+            party[i] = gain_exp(member, exp)
+            if party[i].get("level", 1) > before_lv:
+                result["level_ups"].append({
+                    "name": party[i]["name"],
+                    "new_level": party[i]["level"],
+                })
+
+    result["summary"] = _build_battle_summary(result, party, enemy)
+    return result
 
 
-def get_default_enemy() -> Character:
-    return Character(
-        name="闇の魔王ザーグ",
-        hp=150, max_hp=150,
-        mp=80,  max_mp=80,
-        attack=30, defense=8,
-        magic=35, speed=12,
-    )
+def _build_battle_summary(result: dict, party: list, enemy: dict) -> str:
+    parts = []
+    for a in result.get("party_actions", []):
+        if a.get("miss"):
+            parts.append(f"{a['member']}の行動は失敗（{a.get('reason', 'ミス')}）")
+        elif a.get("damage", 0) > 0:
+            parts.append(f"{a['member']}が{enemy['name']}に{a['damage']}ダメージ")
+        elif a.get("heal", 0) > 0:
+            parts.append(f"{a['member']}がHPを{a['heal']}回復")
+        elif a.get("defend"):
+            parts.append(f"{a['member']}は防御態勢をとった")
+
+    if result.get("enemy_damage_dealt", 0) > 0:
+        first_alive = next((m for m in party if m["hp"] > 0), party[0])
+        parts.append(f"{enemy['name']}が{first_alive['name']}に{result['enemy_damage_dealt']}ダメージ")
+    if result.get("poison_damage", 0) > 0:
+        parts.append(f"毒で{result['poison_damage']}ダメージ")
+
+    if result["outcome"] == "player_win":
+        parts.append(f"★ {enemy['name']}を倒した！ EXP+{result.get('exp_gained', 0)}")
+        for lu in result.get("level_ups", []):
+            parts.append(f"⬆️ {lu['name']}がLv{lu['new_level']}にレベルアップ！")
+    elif result["outcome"] == "enemy_win":
+        parts.append("★ パーティー全滅。ゲームオーバー。")
+
+    # HP状況サマリー
+    hp_parts = []
+    for m in party:
+        hp_parts.append(f"{m['name']}: HP{m['hp']}/{m['max_hp']}")
+    hp_parts.append(f"{enemy['name']}: HP{enemy['hp']}/{enemy['max_hp']}")
+    parts.append("（" + " | ".join(hp_parts) + "）")
+
+    return " / ".join(parts)

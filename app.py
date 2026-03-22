@@ -1,6 +1,6 @@
 """
-app.py
-Streamlit チャット UI — 自律成長するワールド・エージェント PoC
+app.py (v2)
+Streamlit チャット UI — フルRPGワールド対応版
 """
 
 import os
@@ -9,330 +9,378 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- ページ設定（Streamlit起動の最初に必ず呼ぶ） ---
 st.set_page_config(
-    page_title="World Agent PoC | アルデニア大陸",
+    page_title="アルデニア大陸 | World Agent RPG",
     page_icon="⚔️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# --- カスタムCSS ---
+# カスタムCSS
 st.markdown("""
 <style>
-/* 全体背景 */
 [data-testid="stAppViewContainer"] {
-    background: linear-gradient(135deg, #0d1117 0%, #161b22 50%, #0d1117 100%);
+    background: linear-gradient(135deg, #0d1117 0%, #161b22 60%, #0d1117 100%);
 }
 [data-testid="stSidebar"] {
     background: linear-gradient(180deg, #161b22 0%, #0d1117 100%);
     border-right: 1px solid #30363d;
 }
-/* ヘッダー */
 h1 { color: #f0e6c8 !important; font-family: 'Georgia', serif; }
 h3, h4 { color: #c9a96e !important; }
-/* チャットメッセージ */
 [data-testid="stChatMessage"] {
-    background: rgba(22, 27, 34, 0.8) !important;
-    border: 1px solid #30363d;
-    border-radius: 12px;
-    margin-bottom: 8px;
+    background: rgba(22, 27, 34, 0.85) !important;
+    border: 1px solid #30363d; border-radius: 12px; margin-bottom: 8px;
 }
-/* プログレスバーのHP色 */
-.stProgress > div > div > div {
-    background: linear-gradient(90deg, #4ade80, #22c55e);
-}
-/* Referee成功バッジ */
-[data-testid="stSuccess"] {
-    background: rgba(34, 197, 94, 0.1) !important;
-    border: 1px solid rgba(34, 197, 94, 0.3) !important;
-}
-/* Referee警告バッジ */
-[data-testid="stWarning"] {
-    background: rgba(234, 179, 8, 0.1) !important;
-    border: 1px solid rgba(234, 179, 8, 0.3) !important;
-}
+.stProgress > div > div > div { background: linear-gradient(90deg, #4ade80, #22c55e); }
 </style>
 """, unsafe_allow_html=True)
 
-# ---------------------------------------------------------------------------
-# 遅延インポート（APIキー確認後）
-# ---------------------------------------------------------------------------
-import rules
+# --- 遅延インポート ---
 import agents
-from rules import Character, get_default_player, get_default_enemy
-from world_memory import WorldMemory
-
+from game_state import GameState
+from world_map import get_available_actions, get_world_map_text, LOCATIONS
 
 # ---------------------------------------------------------------------------
 # セッション初期化
 # ---------------------------------------------------------------------------
+
 def init_session():
-    if "player" not in st.session_state:
-        st.session_state.player = get_default_player()
-    if "enemy" not in st.session_state:
-        st.session_state.enemy = get_default_enemy()
+    if "game_state" not in st.session_state:
+        st.session_state.game_state = GameState()
     if "messages" not in st.session_state:
         st.session_state.messages = [
             {
                 "role": "assistant",
                 "avatar": "📖",
                 "content": (
-                    "**アルデニア大陸へようこそ。**\n\n"
-                    "闇の魔王ザーグが復活し、世界は再び危機に晒されている。\n"
-                    "勇者アレンよ——汝の行動がこの世界の歴史を刻む。\n\n"
-                    "**行動を入力して、戦いを始めよ。**\n\n"
-                    "例: `剣で攻撃する` / `魔法を使う` / `回復する` / `防御する` / `逃げる`"
+                    "## ⚔️ アルデニア大陸へようこそ\n\n"
+                    "闇の魔王ザーグが復活し、世界に危機が迫っている。\n"
+                    "勇者アレンよ、汝の冒険がいま始まる。\n\n"
+                    "**📍 現在地: 始まりの村リーデン**\n\n"
+                    "行動を自由に入力してください。\n"
+                    "例: `西の町へ行く` / `長老に話しかける` / `探索する` / `休む`\n\n"
+                    "> 💡 **装備を追加したい場合は「装備を追加」ボタンを使ってください。**"
                 ),
             }
         ]
     if "world_memory" not in st.session_state:
         with st.spinner("🌍 世界記憶を初期化中..."):
+            from world_memory import WorldMemory
             st.session_state.world_memory = WorldMemory()
-    if "game_over" not in st.session_state:
-        st.session_state.game_over = False
-    if "turn_count" not in st.session_state:
-        st.session_state.turn_count = 0
+    if "show_equipment_panel" not in st.session_state:
+        st.session_state.show_equipment_panel = False
 
 
 init_session()
+gs: GameState = st.session_state.game_state
 
 
 # ---------------------------------------------------------------------------
-# コンポーネント: キャラクターステータス表示
+# コンポーネント: キャラクターステータス
 # ---------------------------------------------------------------------------
-def render_character_stats(char: Character, label: str, icon: str = "⚔️"):
-    st.markdown(f"##### {icon} {label}")
-    st.markdown(f"**{char.name}**")
 
-    hp_pct = char.hp / char.max_hp if char.max_hp > 0 else 0
-    mp_pct = char.mp / char.max_mp if char.max_mp > 0 else 0
+def render_member_stats(member: dict, compact: bool = False):
+    name  = member.get("name", "?")
+    hp    = member.get("hp", 0)
+    maxhp = member.get("max_hp", 1)
+    mp    = member.get("mp", 0)
+    maxmp = member.get("max_mp", 1)
+    lv    = member.get("level", 1)
+    exp   = member.get("exp", 0)
+    exp_n = member.get("exp_to_next", 100)
 
-    # HP バー
-    hp_color = (
-        "🟢" if hp_pct > 0.6 else
-        "🟡" if hp_pct > 0.3 else
-        "🔴"
-    )
-    st.markdown(f"{hp_color} **HP** `{char.hp} / {char.max_hp}`")
-    st.progress(max(0.0, min(1.0, hp_pct)))
+    hp_pct = max(0.0, min(1.0, hp / maxhp))
+    mp_pct = max(0.0, min(1.0, mp / maxmp))
+    hp_icon = "🟢" if hp_pct > 0.6 else "🟡" if hp_pct > 0.3 else "🔴"
+    alive_label = "" if hp > 0 else " 💀"
 
-    # MP バー
-    st.markdown(f"🔵 **MP** `{char.mp} / {char.max_mp}`")
-    st.progress(max(0.0, min(1.0, mp_pct)))
+    st.markdown(f"**{name}** Lv.{lv}{alive_label}")
+    st.markdown(f"{hp_icon} HP `{hp}/{maxhp}`")
+    st.progress(hp_pct)
+    st.markdown(f"🔵 MP `{mp}/{maxmp}`")
+    st.progress(mp_pct)
 
-    # ステータス
-    col1, col2 = st.columns(2)
-    with col1:
-        st.caption(f"⚔ATK `{char.attack}`")
-        st.caption(f"🛡DEF `{char.defense}`")
-    with col2:
-        st.caption(f"✨MAG `{char.magic}`")
-        st.caption(f"💨SPD `{char.speed}`")
+    if not compact:
+        exp_pct = min(1.0, exp / max(1, exp_n))
+        st.markdown(f"⭐ EXP `{exp}/{exp_n}`")
+        st.progress(exp_pct)
 
-    if char.status_effects:
-        st.warning(f"⚠️ 状態異常: `{'・'.join(char.status_effects)}`")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.caption(f"⚔ ATK`{member.get('attack',0)}`")
+            st.caption(f"🛡 DEF`{member.get('defense',0)}`")
+        with col2:
+            st.caption(f"✨ MAG`{member.get('magic',0)}`")
+            st.caption(f"💨 SPD`{member.get('speed',0)}`")
+
+        equip = member.get("equipment", {})
+        if equip:
+            with st.expander("🎒 装備中"):
+                for slot, item in equip.items():
+                    bonuses = []
+                    if item.get("bonus_attack", 0):  bonuses.append(f"ATK+{item['bonus_attack']}")
+                    if item.get("bonus_defense", 0): bonuses.append(f"DEF+{item['bonus_defense']}")
+                    if item.get("bonus_magic", 0):   bonuses.append(f"MAG+{item['bonus_magic']}")
+                    st.caption(f"[{slot}] **{item['name']}** {' '.join(bonuses)}")
+
+        if member.get("status_effects"):
+            st.warning(f"⚠️ `{'・'.join(member['status_effects'])}`")
+
+
+def render_enemy_stats(enemy: dict):
+    if not enemy:
+        return
+    hp    = enemy.get("hp", 0)
+    maxhp = enemy.get("max_hp", 1)
+    hp_pct = max(0.0, min(1.0, hp / maxhp))
+    hp_icon = "🟢" if hp_pct > 0.6 else "🟡" if hp_pct > 0.3 else "🔴"
+    phase2 = enemy.get("phase2_active", False)
+    label = f"**{enemy['name']}**"
+    if phase2:
+        label += " 🔥 第2形態"
+    st.markdown(label)
+    st.markdown(f"{hp_icon} HP `{hp}/{maxhp}`")
+    st.progress(hp_pct)
 
 
 # ---------------------------------------------------------------------------
 # サイドバー
 # ---------------------------------------------------------------------------
+
 with st.sidebar:
-    st.markdown("## ⚔️ ステータス")
+    st.markdown("## 📊 ゲーム情報")
     st.divider()
 
-    render_character_stats(st.session_state.player, "プレイヤー", "🧙")
-    st.divider()
-    render_character_stats(st.session_state.enemy, "敵", "👹")
-    st.divider()
-
-    st.markdown(f"🕐 **経過ターン数:** `{st.session_state.turn_count}`")
-    st.divider()
-
-    st.markdown("**💡 行動コマンド例**")
-    commands = [
-        ("⚔️", "剣で攻撃する"),
-        ("✨", "魔法を使う"),
-        ("💚", "回復する"),
-        ("🛡️", "防御する"),
-        ("🏃", "逃げる"),
-    ]
-    for icon, cmd in commands:
-        st.caption(f"{icon} `{cmd}`")
+    st.markdown(f"**📍 現在地**")
+    loc_data = LOCATIONS.get(gs.current_location, {})
+    st.info(loc_data.get("display_name", gs.current_location))
 
     st.divider()
+    st.markdown("**👥 パーティー**")
+    for i, member in enumerate(gs.party):
+        with st.expander(f"{'💀' if member.get('hp',0)<=0 else '🧙' if member.get('is_player') else '⚔️'} {member['name']} Lv.{member.get('level',1)}", expanded=(i==0)):
+            render_member_stats(member, compact=False)
 
-    if st.button("🔄 ゲームをリセット", use_container_width=True, type="secondary"):
-        for key in ["player", "enemy", "messages", "game_over", "turn_count", "world_memory"]:
-            if key in st.session_state:
-                del st.session_state[key]
-        st.rerun()
+    if gs.in_battle and gs.current_enemy:
+        st.divider()
+        st.markdown("**👹 交戦中の敵**")
+        render_enemy_stats(gs.current_enemy)
 
     st.divider()
-    with st.expander("ℹ️ システム情報"):
-        st.caption("**LLM:** gpt-4o")
-        st.caption("**RAG:** FAISS (local)")
-        st.caption("**構成:** GM Agent + Referee Agent")
-        st.caption("**バトル計算:** rules.py (LLM不関与)")
-        faiss_path = "faiss_index"
-        if os.path.exists(faiss_path):
-            st.caption("🟢 FAISSインデックス: 有効")
-        else:
-            st.caption("🟡 FAISSインデックス: 未作成")
+    st.markdown("**📜 進行状況**")
+    flags = gs.flags
+    four_count = sum([
+        flags.get("heavenly_lich_defeated", False),
+        flags.get("heavenly_balgan_defeated", False),
+        flags.get("heavenly_sishai_defeated", False),
+        flags.get("heavenly_summoner_defeated", False),
+    ])
+    st.caption(f"四天王討伐: {four_count}/4")
+    st.caption(f"古代神殿封印: {'✅' if flags.get('lucifer_seal_broken') else '❌'}")
+    st.caption(f"魔王城: {'🔓 解放済' if flags.get('maou_castle_unlocked') else '🔒 封印中'}")
+    st.caption(f"ターン数: {gs.turn}")
+
+    st.divider()
+    st.markdown("**🗺️ ワールドマップ**")
+    with st.expander("マップを見る"):
+        st.code(get_world_map_text(gs.current_location).replace("```", ""), language=None)
+
+    st.divider()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("🎒 装備追加", use_container_width=True):
+            st.session_state.show_equipment_panel = not st.session_state.show_equipment_panel
+    with col2:
+        if st.button("🔄 リセット", use_container_width=True, type="secondary"):
+            for key in ["game_state", "messages", "world_memory", "show_equipment_panel"]:
+                if key in st.session_state:
+                    del st.session_state[key]
+            st.rerun()
 
 
 # ---------------------------------------------------------------------------
 # メインエリア
 # ---------------------------------------------------------------------------
-st.markdown("# 🌍 自律成長するワールド・エージェント")
-st.caption("あなたの行動が世界の歴史を刻む — AIが語るRPGアドベンチャー PoC | Powered by LangChain + FAISS")
+
+st.markdown("# 🌍 自律成長するワールド・エージェント RPG")
+st.caption("始まりの村から魔王討伐まで — 自由に冒険できるAI駆動RPG | LangChain + FAISS + Streamlit")
 st.divider()
 
+
 # ---------------------------------------------------------------------------
-# チャット履歴表示
+# 装備追加パネル
 # ---------------------------------------------------------------------------
+
+if st.session_state.show_equipment_panel:
+    with st.expander("🎒 装備追加パネル", expanded=True):
+        st.markdown("**自然文で装備を説明してください。Refereeがバランス検証を行います。**")
+        st.caption("例: `炎が宿った魔法の剣（ATK+20補正）` / `鋼鉄の盾（DEF大幅強化）` / `回復ポーション×3`")
+
+        target_names = [m["name"] for m in gs.party]
+        selected_target = st.selectbox("装備させるキャラクター", target_names)
+        equip_input = st.text_area("装備の説明", placeholder="炎の剣、攻撃力がかなり上がる魔法の武器...")
+
+        if st.button("✅ Refereeに検証させる", type="primary"):
+            if equip_input.strip():
+                target = next((m for m in gs.party if m["name"] == selected_target), gs.party[0])
+                with st.spinner("Referee が装備を検証中..."):
+                    result = agents.add_equipment_pipeline(equip_input, target, gs, st.session_state.world_memory)
+
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "avatar": "🛡️",
+                    "content": result["narrative"],
+                    "referee": {
+                        "valid": result["success"],
+                        "issues": result.get("item", {}).get("issues", []),
+                    },
+                })
+                st.session_state.show_equipment_panel = False
+                st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# チャット履歴
+# ---------------------------------------------------------------------------
+
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"], avatar=msg.get("avatar", "🧙")):
         st.markdown(msg["content"])
 
-        # Referee バッジ表示
+        # Referee バッジ
         if msg.get("referee"):
             ref = msg["referee"]
             if ref.get("valid", True):
-                st.success("✅ Referee: ルール・世界設定との整合性を確認しました")
+                if ref.get("issues") == []:
+                    pass  # 問題なしは表示不要（ノイズになる）
             else:
-                issues_text = "\n".join(f"• {i}" for i in ref.get("issues", []))
-                st.warning(
-                    f"⚠️ Referee: 以下の問題を検出し修正しました\n{issues_text}"
-                )
+                issues = "\n".join(f"• {i}" for i in ref.get("issues", []))
+                st.warning(f"⚠️ **Referee修正:** \n{issues}")
 
-        # RAG コンテキスト（展開可能）
-        if msg.get("context"):
-            with st.expander("📚 参照した世界設定（RAGコンテキスト）"):
+        # RAGコンテキスト
+        if msg.get("context") and msg["context"].strip():
+            with st.expander("📚 参照した世界設定（RAG）"):
                 for line in msg["context"].split("\n"):
                     if line.strip():
                         st.caption(line)
 
-        # バトル詳細（展開可能）
-        if msg.get("battle_info"):
-            br = msg["battle_info"]
-            with st.expander("⚔️ バトル詳細（確定的計算結果 — rules.py）"):
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric(
-                        "与ダメージ",
-                        br.get("player_damage_dealt", 0),
-                        help="rules.pyで計算した確定値"
-                    )
-                with col2:
-                    st.metric(
-                        "受ダメージ",
-                        br.get("enemy_damage_dealt", 0),
-                    )
-                with col3:
-                    st.metric(
-                        "回復量",
-                        br.get("player_heal", 0),
-                    )
-                with col4:
-                    st.metric(
-                        "毒ダメージ",
-                        br.get("poison_damage", 0),
-                    )
+        # バトル詳細
+        if msg.get("battle_result"):
+            br = msg["battle_result"]
+            with st.expander("⚔️ バトル詳細（確定計算 by rules.py）"):
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("総与ダメージ", br.get("total_player_damage", 0))
+                c2.metric("受ダメージ", br.get("enemy_damage_dealt", 0))
+                c3.metric("回復量", br.get("total_heal", 0))
+                c4.metric("EXP獲得", br.get("exp_gained", 0))
                 if br.get("reason"):
                     st.info(f"ℹ️ {br['reason']}")
-                if br.get("action_type"):
-                    st.caption(f"行動種別: `{br['action_type']}`")
+
+        # 行動サジェスト
+        if msg.get("available_actions"):
+            with st.expander("💡 この場所でできること"):
+                for act in msg["available_actions"][:8]:
+                    st.caption(f"▶ {act}")
+
+        # レベルアップ通知
+        if msg.get("level_ups"):
+            for lu in msg["level_ups"]:
+                st.success(f"⬆️ **{lu['name']}** が **Lv.{lu['new_level']}** にレベルアップ！")
 
 
 # ---------------------------------------------------------------------------
 # 入力エリア
 # ---------------------------------------------------------------------------
-if not st.session_state.game_over:
+
+if not gs.game_over and not gs.victory:
     if not os.getenv("OPENAI_API_KEY"):
-        st.error(
-            "⛔ `.env` ファイルに `OPENAI_API_KEY` が設定されていません。\n\n"
-            "`.env.example` をコピーして `.env` を作成し、APIキーを設定してください。"
-        )
+        st.error("⛔ `.env` ファイルに `OPENAI_API_KEY` が設定されていません。")
     else:
+        # バトル中のクイックアクションボタン
+        if gs.in_battle:
+            st.markdown("**⚡ クイックアクション:**")
+            cols = st.columns(5)
+            quick_actions = ["剣で攻撃する", "魔法を使う", "回復する", "防御する", "逃げる"]
+            for i, (col, act) in enumerate(zip(cols, quick_actions)):
+                if col.button(act, key=f"quick_{i}", use_container_width=True):
+                    st.session_state._pending_action = act
+        else:
+            # 現在地の行動サジェスト
+            actions = get_available_actions(gs.current_location, gs)
+            if actions:
+                st.markdown("**💡 行動例:**")
+                cols = st.columns(min(4, len(actions)))
+                for i, (col, act) in enumerate(zip(cols, actions[:4])):
+                    short = act[:20] + "..." if len(act) > 20 else act
+                    if col.button(short, key=f"suggest_{i}", use_container_width=True):
+                        st.session_state._pending_action = act
+
         user_input = st.chat_input(
-            "行動を入力してください（例: 剣で攻撃する）",
-            disabled=st.session_state.game_over,
+            "行動を自由に入力（例: 西の町へ行く / 魔法で攻撃 / 長老と話す）",
         )
 
-        if user_input:
-            # ------ ユーザーメッセージを表示 ------
+        # ボタンからの入力を優先
+        pending = st.session_state.pop("_pending_action", None)
+        final_input = pending or user_input
+
+        if final_input:
             st.session_state.messages.append({
                 "role": "user",
                 "avatar": "🧙",
-                "content": user_input,
+                "content": final_input,
             })
 
-            # ------ ターン処理 ------
-            with st.spinner("⚙️ GM・Refereeエージェントが処理中..."):
+            with st.spinner("⚙️ 処理中..."):
                 try:
-                    player = st.session_state.player
-                    enemy = st.session_state.enemy
-                    wm = st.session_state.world_memory
-
                     turn_result = agents.run_turn(
-                        player_action=user_input,
-                        player=player,
-                        enemy=enemy,
-                        world_memory=wm,
-                        max_retries=2,
+                        final_input,
+                        gs,
+                        st.session_state.world_memory,
                     )
+                    gs.turn += 1 if turn_result.get("type") not in ["move", "rest", "shop"] else 0
 
-                    # ------ キャラクター状態を更新 ------
-                    st.session_state.player = Character.from_dict(turn_result["player"])
-                    st.session_state.enemy = Character.from_dict(turn_result["enemy"])
-                    st.session_state.turn_count += 1
-
-                    # ------ GMナラティブをチャットに追加 ------
-                    st.session_state.messages.append({
+                    msg_data = {
                         "role": "assistant",
-                        "avatar": "📖",
-                        "content": turn_result["narrative"],
-                        "referee": turn_result["referee"],
-                        "context": turn_result["context_used"],
-                        "battle_info": turn_result["battle_result"],
-                    })
+                        "avatar": _get_avatar(turn_result.get("type", "free")),
+                        "content": turn_result.get("narrative", ""),
+                        "referee": turn_result.get("referee"),
+                        "context": turn_result.get("context_used", ""),
+                        "battle_result": turn_result.get("battle_result"),
+                        "available_actions": turn_result.get("available_actions", []),
+                        "level_ups": turn_result.get("level_ups", []),
+                    }
+                    st.session_state.messages.append(msg_data)
 
-                    # ------ ゲームオーバー / 勝利判定 ------
-                    outcome = turn_result.get("outcome", "ongoing")
+                    outcome = turn_result.get("outcome", "")
 
-                    if outcome == "player_win":
-                        st.session_state.game_over = True
+                    if outcome == "player_win" and turn_result.get("is_maou_battle"):
+                        gs.victory = True
                         st.balloons()
                         st.session_state.messages.append({
-                            "role": "assistant",
-                            "avatar": "🏆",
+                            "role": "assistant", "avatar": "🏆",
                             "content": (
-                                "## 🎉 勝利！\n\n"
-                                f"**{st.session_state.turn_count}ターン**で闇の魔王ザーグを討伐しました！\n\n"
-                                "あなたの英雄譚はアルデニアの歴史に永遠に刻まれました。\n\n"
-                                "*サイドバーの「ゲームリセット」で新しい冒険を始められます。*"
+                                "## 🎉 魔王討伐！ — エンディング\n\n"
+                                f"**{gs.turn}ターン**の戦いの末、闇の魔王ザーグを倒した！\n\n"
+                                "アルデニア大陸に平和が戻り、勇者アレンの名は永遠に語り継がれる。\n\n"
+                                "*「ゲームリセット」で新しい冒険を始められます。*"
                             ),
                         })
 
-                    elif outcome == "enemy_win":
-                        st.session_state.game_over = True
+                    elif gs.game_over or outcome == "enemy_win":
+                        gs.game_over = True
                         st.session_state.messages.append({
-                            "role": "assistant",
-                            "avatar": "💀",
+                            "role": "assistant", "avatar": "💀",
                             "content": (
-                                "## 💀 ゲームオーバー\n\n"
-                                "勇者アレンは力尽き、アルデニアに闇が覆い尽くした...\n\n"
-                                "*サイドバーの「ゲームリセット」で再挑戦できます。*"
+                                "## 💀 全滅...\n\n"
+                                "パーティーは力尽きた。アルデニアに闇が広がっていく...\n\n"
+                                "*「🔄 リセット」で再挑戦できます。*"
                             ),
                         })
 
-                    elif outcome == "fled":
-                        st.session_state.messages.append({
-                            "role": "assistant",
-                            "avatar": "🏃",
-                            "content": "戦場から離脱することに成功した。しかし、魔王はまだ健在だ...",
-                        })
+                    elif outcome == "player_win":
+                        pass  # 通常の敵討伐はナラティブ内で表現済み
 
                 except Exception as e:
                     st.error(f"⚠️ エラーが発生しました: {e}")
@@ -342,9 +390,17 @@ if not st.session_state.game_over:
 
             st.rerun()
 
+elif gs.victory:
+    st.success("🏆 ゲームクリア！魔王討伐おめでとうございます！「🔄 リセット」で再プレイできます。")
+
 else:
-    # ゲーム終了後のUI
-    st.info(
-        "🏁 ゲームが終了しました。"
-        "サイドバーの **「🔄 ゲームをリセット」** ボタンで新しい冒険を始められます。"
-    )
+    st.error("💀 ゲームオーバー。「🔄 リセット」で再チャレンジしましょう。")
+
+
+def _get_avatar(action_type: str) -> str:
+    return {
+        "move": "🗺️", "rest": "🏨", "shop": "🏪",
+        "join": "🤝", "battle": "⚔️", "phase2": "🔥",
+        "battle_start": "⚔️", "encounter": "👹",
+        "blocked": "🚫", "free": "📖", "explore": "🌿",
+    }.get(action_type, "📖")
